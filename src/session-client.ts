@@ -66,9 +66,11 @@ const BROWSER_USER_AGENT =
 
 export class FamilySearchSessionClient {
   private cookies: string;
+  private sessionId: string;
 
   constructor(options: SessionClientOptions) {
     this.cookies = options.cookies || buildCookieHeader(options.sessionId, options.fsAnid);
+    this.sessionId = options.sessionId || extractCookieValue(this.cookies, 'fssessionid');
   }
 
   isAuthenticated(): boolean {
@@ -77,18 +79,37 @@ export class FamilySearchSessionClient {
 
   setSession(sessionId: string, fsAnid?: string, cookies?: string): void {
     this.cookies = cookies || buildCookieHeader(sessionId, fsAnid);
+    this.sessionId = sessionId || extractCookieValue(this.cookies, 'fssessionid');
   }
 
   private cookieHeader(): string {
     return this.cookies;
   }
 
-  private async request<T>(path: string, params?: Record<string, string | number | boolean | undefined>): Promise<T> {
+  private async platformRequest<T>(path: string): Promise<T> {
+    if (!this.sessionId) {
+      throw new FamilySearchSessionError('No fssessionid in session cookies. Re-run login-with-browser.', 401);
+    }
+    return this.request<T>(path, undefined, {
+      Accept: 'application/x-gedcomx-v1+json',
+      Authorization: `Bearer ${this.sessionId}`,
+    });
+  }
+
+  private async request<T>(
+    path: string,
+    params?: Record<string, string | number | boolean | undefined>,
+    extraHeaders: Record<string, string> = {},
+  ): Promise<T> {
     if (!this.cookies) {
       throw new FamilySearchSessionError('Not authenticated. Set a browser session cookie first.');
     }
 
     const url = new URL(path.startsWith('http') ? path : `${BASE_URL}${path}`);
+    // Absolute URLs can come from API responses; never send the session to another host.
+    if (url.protocol !== 'https:' || (url.hostname !== 'familysearch.org' && !url.hostname.endsWith('.familysearch.org'))) {
+      throw new FamilySearchSessionError(`Refusing to send session to ${url.origin} (only https://*.familysearch.org)`);
+    }
     if (params) {
       for (const [key, value] of Object.entries(params)) {
         if (value !== undefined && value !== null && value !== '') {
@@ -103,6 +124,7 @@ export class FamilySearchSessionClient {
         Cookie: this.cookieHeader(),
         Referer: 'https://www.familysearch.org/en/',
         'User-Agent': BROWSER_USER_AGENT,
+        ...extraHeaders,
       },
     });
 
@@ -279,26 +301,120 @@ export class FamilySearchSessionClient {
 
   async getFamilyMembers(personId: string) {
     return this.request<{
-      parents?: Array<{
-        parent1?: PersonSummary;
-        parent2?: PersonSummary;
-        children?: PersonSummary[];
-      }>;
-      spouses?: Array<{
-        spouse1?: PersonSummary;
-        spouse2?: PersonSummary;
-        children?: PersonSummary[];
-        event?: { details?: { date?: { original?: string }; place?: { localizedText?: string } } };
-      }>;
+      parents?: FamilyGroup[];
+      spouses?: FamilyGroup[];
     }>(`/service/tree/tree-data/r9/family-members/person/${personId}`, {
-      includePhotos: true,
+      includePhotos: false,
       treeId: 'PRIVATE',
     });
   }
 
+  async getFamily(personId: string) {
+    const family = await this.getFamilyMembers(personId);
+    const lines: string[] = [];
+
+    for (const group of family.parents || []) {
+      lines.push(`Parents: ${formatSummary(group.parent1)} & ${formatSummary(group.parent2)}${formatMarriage(group)}`);
+      for (const { child } of group.children || []) {
+        if (child?.id && child.id !== personId) lines.push(`  Sibling: ${formatSummary(child)}`);
+      }
+    }
+
+    for (const group of family.spouses || []) {
+      const spouse = group.parent1?.id === personId ? group.parent2 : group.parent1;
+      lines.push(`Spouse: ${formatSummary(spouse)}${formatMarriage(group)}`);
+      for (const { child } of group.children || []) {
+        if (child?.id) lines.push(`  Child: ${formatSummary(child)}`);
+      }
+    }
+
+    return lines.length ? lines : ['No family members found.'];
+  }
+
+  // The platform /matches endpoint answers 204 for every person, so hints come from the pedigree view.
+  async getResearchSuggestions(personId: string, generations = 4) {
+    const data = await this.request<{ ancestors?: PedigreeCouple[][]; children?: PedigreeCouple[] }>(
+      `/service/tree/tree-data/r9/portrait-pedigree/${personId}`,
+      {
+        numGenerations: Math.min(Math.max(generations, 1), 8),
+        treeId: 'PRIVATE',
+        includePhotos: false,
+        includeTempleRollupStatus: false,
+        includeRecordHints: true,
+        includeSpouseAncestry: false,
+      },
+    );
+
+    const people = new Map<string, PedigreePerson>();
+    const coupleLines: string[] = [];
+    for (const couple of [...(data.ancestors || []).flat(), ...(data.children || [])]) {
+      for (const person of [couple.parent1, couple.parent2]) {
+        if (person?.id && !people.has(person.id)) people.set(person.id, person);
+      }
+      const names = suggestionNames(couple);
+      if (names.length) {
+        coupleLines.push(`- Couple ${couple.parent1?.name || '?'} & ${couple.parent2?.name || '?'}: ${names.join(', ')}`);
+      }
+    }
+
+    const lines: string[] = [];
+    for (const person of people.values()) {
+      const flags = [...(person.hasRecordHints ? ['RECORD_HINTS'] : []), ...suggestionNames(person)];
+      if (flags.length) lines.push(`- ${formatSummary(person)}: ${flags.join(', ')}`);
+    }
+    return [...lines, ...coupleLines];
+  }
+
+  async getRecord(recordId: string) {
+    const persona = await this.platformRequest<GedcomxRecord>(`/platform/records/personas/${recordId}`);
+
+    // A persona only carries its own person; the full record (all persons and relationships) sits behind 1:2 ark.
+    const recordUrl = persona.sourceDescriptions?.find((sd) => sd.resourceType === 'http://gedcomx.org/Record')?.about;
+    let record: GedcomxRecord | undefined;
+    if (recordUrl) {
+      record = await this.platformRequest<GedcomxRecord>(recordUrl).catch(() => undefined);
+    }
+    const source = record?.persons?.length ? record : persona;
+
+    const lines = [`Record: ${recordId}`, `Collection: ${collectionTitle(persona) || 'Unknown'}`];
+    const citation = persona.sourceDescriptions?.find((sd) => sd.citations?.length)?.citations?.[0]?.value;
+    if (citation) lines.push(`Citation: ${citation.replace(/<[^>]+>/g, '')}`);
+    const image = persona.sourceDescriptions?.find((sd) => sd.resourceType === 'http://gedcomx.org/DigitalArtifact')?.about;
+    if (image) lines.push(`Image: ${image}`);
+
+    const names = new Map<string, string>();
+    for (const person of source.persons || []) {
+      names.set(person.id || '', personName(person));
+    }
+
+    lines.push('', 'Persons:');
+    for (const person of source.persons || []) {
+      const gender = gedcomxType(person.gender?.type) || '';
+      const role = person.principal ? ' [principal]' : '';
+      lines.push(`- ${personName(person)}${gender ? ` (${gender})` : ''}${role}`);
+      const facts = formatFacts(person);
+      if (facts) lines.push(`    ${facts}`);
+      const fields = formatFields(person.fields);
+      if (fields) lines.push(`    ${fields}`);
+    }
+
+    if (source.relationships?.length) {
+      lines.push('', 'Relationships:');
+      for (const rel of source.relationships) {
+        const p1 = names.get(resourceId(rel.person1)) || rel.person1?.resource || '?';
+        const p2 = names.get(resourceId(rel.person2)) || rel.person2?.resource || '?';
+        const type = gedcomxType(rel.type) || 'Relationship';
+        const facts = (rel.facts || []).map(formatFact).join('; ');
+        lines.push(`- ${type}: ${p1} → ${p2}${facts ? ` (${facts})` : ''}`);
+      }
+    }
+
+    return lines;
+  }
+
   async getAncestors(personId: string, generations = 4) {
     const gens = Math.min(Math.max(generations, 1), 8);
-    const data = await this.request<{ ancestors?: AncestorGeneration[][] }>(
+    const data = await this.request<{ ancestors?: PedigreeCouple[][] }>(
       `/service/tree/tree-data/r9/portrait-pedigree/${personId}`,
       {
         numGenerations: gens,
@@ -363,15 +479,10 @@ export class FamilySearchSessionClient {
       const family = await this.getFamilyMembers(currentId);
       const children = new Map<string, PersonSummary>();
 
+      // Only spouse groups hold the person's own children; parent groups hold siblings.
       for (const spouseGroup of family.spouses || []) {
-        for (const child of spouseGroup.children || []) {
-          if (child.id) children.set(child.id, child);
-        }
-      }
-
-      for (const parentGroup of family.parents || []) {
-        for (const child of parentGroup.children || []) {
-          if (child.id && child.id !== currentId) children.set(child.id, child);
+        for (const entry of spouseGroup.children || []) {
+          if (entry.child?.id) children.set(entry.child.id, entry.child);
         }
       }
 
@@ -394,71 +505,44 @@ export class FamilySearchSessionClient {
     return lines;
   }
 
-  async searchRecords(params: {
-    givenName?: string;
-    surname?: string;
-    birthDate?: string;
-    birthPlace?: string;
-    deathDate?: string;
-    deathPlace?: string;
-    collectionId?: string;
-    limit?: number;
-  }) {
+  async searchRecords(params: RecordSearchParams) {
     const query: Record<string, string | number> = {
-      count: params.limit || 10,
-      offset: 0,
+      count: Math.min(params.limit || 10, 100),
+      offset: params.offset || 0,
       'm.defaultFacets': 'on',
       'm.facetNestCollectionInCategory': 'on',
       'm.queryRequireDefault': 'on',
     };
 
-    if (params.givenName) query['q.givenName'] = params.givenName;
-    if (params.surname) query['q.surname'] = params.surname;
-    if (params.birthDate) query['q.birthLikeDate.from'] = params.birthDate;
-    if (params.birthPlace) query['q.birthLikePlace'] = params.birthPlace;
-    if (params.deathDate) query['q.deathLikeDate.from'] = params.deathDate;
-    if (params.deathPlace) query['q.deathLikePlace'] = params.deathPlace;
-    if (params.collectionId) query['f.collectionId'] = params.collectionId;
+    for (const [param, key] of RECORD_SEARCH_PARAMS) {
+      const value = params[param];
+      if (value) query[key] = value;
+    }
+    // A single birth/death date used to be passed as an open-ended "from"; keep that for old callers.
+    if (params.birthDate && !params.birthYearFrom) query['q.birthLikeDate.from'] = params.birthDate;
+    if (params.deathDate && !params.deathYearFrom) query['q.deathLikeDate.from'] = params.deathDate;
+    if (params.exactSurname) query['q.surname.exact'] = 'on';
+    if (params.gender) query['q.sex'] = params.gender === 'MALE' ? 'Male' : 'Female';
 
     const data = await this.request<{
-      entries?: Array<{
-        id?: string;
-        title?: string;
-        content?: {
-          gedcomx?: {
-            description?: { title?: string };
-            persons?: Array<{
-              gender?: { type?: string };
-              names?: Array<{ nameForms?: Array<{ fullText?: string }> }>;
-              facts?: Array<{
-                type?: string;
-                date?: { original?: string };
-                place?: { original?: string };
-              }>;
-            }>;
-          };
-        };
-      }>;
+      results?: number;
+      entries?: Array<{ id?: string; title?: string; content?: { gedcomx?: GedcomxRecord & { description?: { title?: string } } } }>;
     }>('/service/search/hr/v2/personas', query);
 
-    return (data.entries || []).map((record) => {
-      const primaryPerson = record.content?.gedcomx?.persons?.[0];
-      const birthFact = primaryPerson?.facts?.find((fact) => fact.type === 'http://gedcomx.org/Birth');
-      const deathFact = primaryPerson?.facts?.find((fact) => fact.type === 'http://gedcomx.org/Death');
-
+    const records = (data.entries || []).map((record) => {
+      const gedcomx = record.content?.gedcomx;
+      const principal = gedcomx?.persons?.find((p) => p.principal) || gedcomx?.persons?.[0];
       return {
         id: record.id || 'Unknown',
-        name: primaryPerson?.names?.[0]?.nameForms?.[0]?.fullText || record.title || 'Unknown',
-        gender: primaryPerson?.gender?.type?.replace('http://gedcomx.org/', '') || 'Unknown',
-        birth: birthFact
-          ? `${birthFact.date?.original || 'Unknown date'} - ${birthFact.place?.original || 'Unknown place'}`
-          : 'Unknown',
-        death: deathFact
-          ? `${deathFact.date?.original || 'Unknown date'} - ${deathFact.place?.original || 'Unknown place'}`
-          : 'Unknown',
-        collection: record.content?.gedcomx?.description?.title || 'Unknown collection',
+        name: principal ? personName(principal) : record.title || 'Unknown',
+        gender: gedcomxType(principal?.gender?.type) || 'Unknown',
+        facts: principal ? formatFacts(principal) : '',
+        relatives: principal && gedcomx ? describeRelatives(gedcomx, principal) : [],
+        collection: collectionTitle(gedcomx) || gedcomx?.description?.title || 'Unknown collection',
       };
     });
+
+    return { total: data.results ?? records.length, records };
   }
 }
 
@@ -467,12 +551,199 @@ interface PersonSummary {
   name?: string;
   gender?: string;
   lifespan?: string;
+  fullLifespan?: string;
   birth?: { date?: string; place?: string };
 }
 
-interface AncestorGeneration {
+interface SuggestionHolder {
+  suggestions?: {
+    researchSuggestionList?: Array<{ type?: { name?: string } }> | null;
+    dataQualityList?: Array<{ type?: { name?: string } }> | null;
+  };
+}
+
+interface PedigreePerson extends PersonSummary, SuggestionHolder {
+  hasRecordHints?: boolean;
+}
+
+interface PedigreeCouple extends SuggestionHolder {
+  parent1?: PedigreePerson;
+  parent2?: PedigreePerson;
+}
+
+function suggestionNames(holder: SuggestionHolder): string[] {
+  return [...(holder.suggestions?.researchSuggestionList || []), ...(holder.suggestions?.dataQualityList || [])]
+    .map((suggestion) => suggestion.type?.name)
+    .filter((name): name is string => Boolean(name));
+}
+
+interface FamilyGroup {
   parent1?: PersonSummary;
   parent2?: PersonSummary;
+  children?: Array<{ child?: PersonSummary }>;
+  event?: {
+    details?: {
+      date?: { originalText?: string; normalizedText?: string };
+      place?: { originalText?: string; normalizedText?: string };
+    };
+  };
+}
+
+interface GedcomxFact {
+  type?: string;
+  date?: { original?: string };
+  place?: { original?: string };
+  value?: string;
+}
+
+interface GedcomxPerson {
+  id?: string;
+  principal?: boolean;
+  gender?: { type?: string };
+  names?: Array<{ nameForms?: Array<{ fullText?: string }> }>;
+  facts?: GedcomxFact[];
+  fields?: Array<{ type?: string; values?: Array<{ type?: string; text?: string }> }>;
+}
+
+interface GedcomxRecord {
+  persons?: GedcomxPerson[];
+  relationships?: Array<{
+    type?: string;
+    person1?: { resource?: string };
+    person2?: { resource?: string };
+    facts?: GedcomxFact[];
+  }>;
+  sourceDescriptions?: Array<{
+    resourceType?: string;
+    about?: string;
+    titles?: Array<{ value?: string }>;
+    citations?: Array<{ value?: string }>;
+  }>;
+}
+
+function formatSummary(person?: PersonSummary): string {
+  if (!person?.id) return 'Unknown';
+  return `${person.name || 'Unknown'} (${person.fullLifespan || person.lifespan || '?'}) [${person.id}]`;
+}
+
+function formatMarriage(group: FamilyGroup): string {
+  const date = group.event?.details?.date?.originalText || group.event?.details?.date?.normalizedText;
+  const place = group.event?.details?.place?.originalText || group.event?.details?.place?.normalizedText;
+  if (!date && !place) return '';
+  return ` — married ${[date, place].filter(Boolean).join(', ')}`;
+}
+
+function personName(person: GedcomxPerson): string {
+  return person.names?.[0]?.nameForms?.[0]?.fullText || 'Unknown';
+}
+
+function gedcomxType(uri?: string): string | undefined {
+  return uri?.split('/').pop();
+}
+
+function resourceId(ref?: { resource?: string }): string {
+  return ref?.resource?.replace(/^.*#/, '') || '';
+}
+
+function formatFact(fact: GedcomxFact): string {
+  const type = gedcomxType(fact.type) || 'Fact';
+  const parts = [fact.value, fact.date?.original, fact.place?.original].filter(Boolean);
+  return `${type}: ${parts.join(', ') || '?'}`;
+}
+
+function formatFacts(person: GedcomxPerson): string {
+  return (person.facts || []).map(formatFact).join('; ');
+}
+
+// Record fields carry extras such as age, occupation or residence that are not modelled as facts.
+function formatFields(fields: GedcomxPerson['fields']): string {
+  return (fields || [])
+    .filter((field) => !field.type?.includes('SortKey'))
+    .map((field) => {
+      const type = gedcomxType(field.type) || 'Field';
+      const text = field.values?.find((v) => v.type?.endsWith('Interpreted'))?.text || field.values?.[0]?.text;
+      return text ? `${type}: ${text}` : '';
+    })
+    .filter(Boolean)
+    .join('; ');
+}
+
+export interface RecordSearchParams {
+  givenName?: string;
+  surname?: string;
+  exactSurname?: boolean;
+  gender?: 'MALE' | 'FEMALE';
+  birthDate?: string;
+  birthYearFrom?: string;
+  birthYearTo?: string;
+  birthPlace?: string;
+  deathDate?: string;
+  deathYearFrom?: string;
+  deathYearTo?: string;
+  deathPlace?: string;
+  marriageYearFrom?: string;
+  marriageYearTo?: string;
+  marriagePlace?: string;
+  residencePlace?: string;
+  anyPlace?: string;
+  spouseGivenName?: string;
+  spouseSurname?: string;
+  fatherGivenName?: string;
+  fatherSurname?: string;
+  motherGivenName?: string;
+  motherSurname?: string;
+  recordCountry?: string;
+  collectionId?: string;
+  limit?: number;
+  offset?: number;
+}
+
+type StringSearchParam = Exclude<keyof RecordSearchParams, 'exactSurname' | 'gender' | 'birthDate' | 'deathDate' | 'limit' | 'offset'>;
+
+const RECORD_SEARCH_PARAMS: ReadonlyArray<[StringSearchParam, string]> = [
+  ['givenName', 'q.givenName'],
+  ['surname', 'q.surname'],
+  ['birthYearFrom', 'q.birthLikeDate.from'],
+  ['birthYearTo', 'q.birthLikeDate.to'],
+  ['birthPlace', 'q.birthLikePlace'],
+  ['deathYearFrom', 'q.deathLikeDate.from'],
+  ['deathYearTo', 'q.deathLikeDate.to'],
+  ['deathPlace', 'q.deathLikePlace'],
+  ['marriageYearFrom', 'q.marriageLikeDate.from'],
+  ['marriageYearTo', 'q.marriageLikeDate.to'],
+  ['marriagePlace', 'q.marriageLikePlace'],
+  ['residencePlace', 'q.residencePlace'],
+  ['anyPlace', 'q.anyPlace'],
+  ['spouseGivenName', 'q.spouseGivenName'],
+  ['spouseSurname', 'q.spouseSurname'],
+  ['fatherGivenName', 'q.fatherGivenName'],
+  ['fatherSurname', 'q.fatherSurname'],
+  ['motherGivenName', 'q.motherGivenName'],
+  ['motherSurname', 'q.motherSurname'],
+  ['recordCountry', 'f.recordCountry'],
+  ['collectionId', 'f.collectionId'],
+];
+
+function describeRelatives(record: GedcomxRecord, principal: GedcomxPerson): string[] {
+  const byId = new Map((record.persons || []).map((p) => [p.id || '', p]));
+  const self = principal.id || '';
+  return (record.relationships || []).flatMap((rel) => {
+    const p1 = resourceId(rel.person1);
+    const p2 = resourceId(rel.person2);
+    if (p1 !== self && p2 !== self) return [];
+    const other = byId.get(p1 === self ? p2 : p1);
+    if (!other) return [];
+    const role = rel.type?.endsWith('Couple') ? 'Spouse' : rel.type?.endsWith('ParentChild') ? (p2 === self ? 'Parent' : 'Child') : 'Related';
+    return [`${role}: ${personName(other)}`];
+  });
+}
+
+function collectionTitle(record?: GedcomxRecord): string | undefined {
+  return record?.sourceDescriptions?.find((sd) => sd.resourceType === 'http://gedcomx.org/Collection')?.titles?.[0]?.value;
+}
+
+export function extractCookieValue(cookieHeader: string, name: string): string {
+  return cookieHeader.match(new RegExp(`(?:^|;\\s*)${name}=([^;]+)`))?.[1] || '';
 }
 
 function buildCookieHeader(sessionId?: string, fsAnid?: string): string {

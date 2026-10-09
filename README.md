@@ -7,12 +7,14 @@ A local [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server 
 - **Family Tree search** — find individuals by name, dates, places, and gender
 - **Person details** — view a person card by ID
 - **Pedigree exploration** — ancestors (up to 8 generations) and descendants (up to 3)
-- **Historical records** — search record collections
+- **Family overview** — parents, siblings, spouses with marriage, and children
+- **Research suggestions** — ancestors with pending record hints or missing data
+- **Historical records** — search record collections with relatives, date ranges and places, and view full records
 - **Browser session auth** — log in once with Brave; no FamilySearch API key required
 
 ## How it works
 
-FamilySearch does not approve direct API access for most personal projects. This server reuses your **browser session cookies** and calls the same internal `/service/` endpoints the website uses. Your session is stored locally at `~/.familysearch-mcp/config.json`.
+FamilySearch does not approve direct API access for most personal projects. This server reuses your **browser session cookies** and calls the same internal `/service/` endpoints the website uses. Record details come from the `/platform/` GEDCOM X API, which receives the same session as a bearer token. Your session is stored locally at `~/.familysearch-mcp/config.json`.
 
 ## Prerequisites
 
@@ -208,7 +210,10 @@ The full cookie string is required — bot protection cookies like `reese84` and
 | `get-person` | Get details for a person by ID |
 | `get-ancestors` | View ancestors (default 4 generations, max 8) |
 | `get-descendants` | View descendants (default 2 generations, max 3) |
-| `search-records` | Search historical record collections |
+| `get-family` | View parents, siblings, spouses (with marriage date and place) and children of a person |
+| `get-research-suggestions` | List ancestors (and the root person's children) with pending record hints or research suggestions such as missing sources or vital dates |
+| `search-records` | Search historical record collections by name, gender, birth/death/marriage year ranges and places, residence or any place, spouse and parent names, record country or collection (`limit` up to 100, `offset` for paging). Hits show the collection, facts with places and related persons |
+| `get-record` | View a historical record by persona ID: collection, citation, image link, all persons and their relationships |
 
 ### Example prompts
 
@@ -226,6 +231,18 @@ Get 4 generations of ancestors for personId G2KQ-JTH
 
 ```
 Search historical records for surname "Reiss" in "Pennsylvania"
+```
+
+```
+Show the family of personId G2KQ-JTH
+```
+
+```
+Which of my ancestors have record hints? Start at personId G2KQ-JTH, 6 generations
+```
+
+```
+Search records for births 1880-1900 with father surname "Reiss" in Germany, then show the full record of the best match
 ```
 
 ---

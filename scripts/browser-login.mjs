@@ -74,6 +74,33 @@ function readLoggedInUser(page) {
   });
 }
 
+async function readUserFromApi(context) {
+  const cookies = await context.cookies(['https://www.familysearch.org']);
+  const session = cookies.find((cookie) => cookie.name === 'fssessionid')?.value;
+  if (!session) {
+    return null;
+  }
+
+  try {
+    const response = await context.request.get('https://www.familysearch.org/platform/users/current', {
+      headers: { Authorization: `Bearer ${session}`, Accept: 'application/x-fs-v1+json' },
+    });
+    if (!response.ok()) {
+      return null;
+    }
+    const current = (await response.json()).users?.[0];
+    if (!current?.id) {
+      return null;
+    }
+    return {
+      displayName: current.displayName || current.contactName || 'FamilySearch user',
+      personId: current.personId || '',
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function main() {
   const bravePath = findBraveExecutable();
   if (!bravePath) {
@@ -87,7 +114,7 @@ async function main() {
   }
 
   console.error(`Opening Brave for FamilySearch login (${bravePath})...`);
-  console.error('Sign in at familysearch.org. This window waits until you are fully logged in (up to 5 minutes).');
+  console.error('Sign in at familysearch.org. This window waits until you are fully logged in (up to 30 minutes).');
 
   const context = await chromium.launchPersistentContext(braveProfileDir, {
     executablePath: bravePath,
@@ -100,36 +127,40 @@ async function main() {
   const page = context.pages()[0] || (await context.newPage());
   await page.goto('https://www.familysearch.org/en/');
 
-  try {
-    await page.waitForFunction(
-      () => {
-        const userKey = Object.keys(localStorage).find((key) => key.endsWith('-v3-user'));
-        if (!userKey) {
-          return false;
-        }
+  let browserClosed = false;
+  context.on('close', () => {
+    browserClosed = true;
+  });
 
-        try {
-          const data = JSON.parse(localStorage.getItem(userKey) || '{}');
-          return Boolean(data.user?.cisId);
-        } catch {
-          return false;
-        }
-      },
-      { timeout: 5 * 60 * 1000 },
-    );
-  } catch {
+  // Poll every tab: the login may finish in a different tab, and the localStorage
+  // key name is not stable, so the platform API is used as a fallback check.
+  let user = null;
+  const deadline = Date.now() + 30 * 60 * 1000;
+  while (!user && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    if (browserClosed || context.pages().length === 0) {
+      console.error('Browser closed before login completed.');
+      process.exit(1);
+    }
+    for (const candidate of context.pages()) {
+      if (!candidate.url().startsWith('https://www.familysearch.org')) continue;
+      user = await readLoggedInUser(candidate).catch(() => null);
+      if (user) break;
+    }
+    user ||= await readUserFromApi(context);
+  }
+  if (!user) {
     console.error('Timed out waiting for login.');
     await context.close();
     process.exit(1);
   }
 
-  const user = await readLoggedInUser(page);
   const cookies = await context.cookies(['https://www.familysearch.org']);
   const cookieHeader = cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join('; ');
   const sessionCookie = cookies.find((cookie) => cookie.name === 'fssessionid');
   const anidCookie = cookies.find((cookie) => cookie.name === 'fs_anid');
 
-  if (!sessionCookie?.value || !user) {
+  if (!sessionCookie?.value) {
     console.error('Login was not detected. Make sure you signed in with your FamilySearch account.');
     await context.close();
     process.exit(1);
