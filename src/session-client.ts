@@ -426,8 +426,14 @@ export class FamilySearchSessionClient {
         title?: string;
         content?: {
           gedcomx?: {
-            description?: { title?: string };
+            description?: string | { title?: string };
+            sourceDescriptions?: Array<{
+              id?: string;
+              resourceType?: string;
+              titles?: Array<{ value?: string }>;
+            }>;
             persons?: Array<{
+              id?: string;
               gender?: { type?: string };
               names?: Array<{ nameForms?: Array<{ fullText?: string }> }>;
               facts?: Array<{
@@ -442,7 +448,18 @@ export class FamilySearchSessionClient {
     }>('/service/search/hr/v2/personas', query);
 
     return (data.entries || []).map((record) => {
-      const primaryPerson = record.content?.gedcomx?.persons?.[0];
+      const gedcomx = record.content?.gedcomx;
+      // `description` points at the matched persona ("#src_p_<personId>"); in household
+      // records (e.g. censuses) that is not necessarily the first person in the list.
+      const descriptionRef = typeof gedcomx?.description === 'string' ? gedcomx.description : '';
+      const matchedId = descriptionRef.startsWith('#src_p_') ? descriptionRef.slice('#src_p_'.length) : '';
+      const primaryPerson =
+        gedcomx?.persons?.find((person) => matchedId && person.id === matchedId) || gedcomx?.persons?.[0];
+      // The collection title lives in sourceDescriptions, not in `description`.
+      const collectionTitle =
+        gedcomx?.sourceDescriptions?.find((source) => source.resourceType === 'http://gedcomx.org/Collection')
+          ?.titles?.[0]?.value ||
+        (typeof gedcomx?.description === 'object' ? gedcomx.description?.title : undefined);
       const birthFact = primaryPerson?.facts?.find((fact) => fact.type === 'http://gedcomx.org/Birth');
       const deathFact = primaryPerson?.facts?.find((fact) => fact.type === 'http://gedcomx.org/Death');
 
@@ -456,7 +473,7 @@ export class FamilySearchSessionClient {
         death: deathFact
           ? `${deathFact.date?.original || 'Unknown date'} - ${deathFact.place?.original || 'Unknown place'}`
           : 'Unknown',
-        collection: record.content?.gedcomx?.description?.title || 'Unknown collection',
+        collection: collectionTitle || 'Unknown collection',
       };
     });
   }
