@@ -1,18 +1,20 @@
 # FamilySearch MCP Server
 
-A local [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server for [FamilySearch](https://www.familysearch.org). Gives AI assistants access to search the Family Tree, view person details, explore ancestors and descendants, and search historical records.
+A local [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server for [FamilySearch](https://www.familysearch.org). Gives AI assistants access to your Family Tree (people, pedigrees, sources, memories, notes, change history, and how you're related to anyone), FamilySearch's research aids (record hints and data-quality checks), and its historical records (indexed records, full-text document search, record collections, and the library catalog).
 
 ## Features
 
-- **Family Tree search** — find individuals by name, dates, places, and gender
-- **Person details** — view a person card by ID
-- **Pedigree exploration** — ancestors (up to 8 generations) and descendants (up to 3)
-- **Historical records** — search record collections
+- **Family Tree** — search people; full person view with facts and immediate family; ancestors (up to 8 generations) and descendants (up to 4) in a single call
+- **Your connection** — how you're related to any person, with the full path; most tools default to your own tree person
+- **Evidence** — attached sources, full historical records (everyone on a census page, marriage entry, etc.), memories, notes, and change history with contributors' reasons
+- **Research aids** — FamilySearch's record hints and data-quality issues (date conflicts, name mismatches, untagged facts)
+- **Historical records** — indexed record search with spouse/parent/residence matching and paging, full-text search of handwritten documents, collection finder, and library catalog search
+- **Standardization** — match place names and interpret genealogical dates ("abt 1869") the way FamilySearch does
 - **Browser session auth** — log in once with Brave; no FamilySearch API key required
 
 ## How it works
 
-FamilySearch does not approve direct API access for most personal projects. This server reuses your **browser session cookies** and calls the same internal `/service/` endpoints the website uses. Your session is stored locally at `~/.familysearch-mcp/config.json`.
+FamilySearch does not approve direct API access for most personal projects. This server reuses your **browser session cookies** and calls the same endpoints the website uses: internal `/service/` endpoints plus FamilySearch's official GEDCOM X `/platform/` API, which accepts the browser session as a bearer token. Your session is stored locally at `~/.familysearch-mcp/config.json`.
 
 ## Prerequisites
 
@@ -203,12 +205,27 @@ The full cookie string is required — bot protection cookies like `reese84` and
 |---|---|
 | `login-with-browser` | Open Brave, log in, and save session locally |
 | `set-session-cookie` | Authenticate by pasting cookies from your browser |
-| `get-current-user` | View your authenticated account info |
+| `get-current-user` | Your account: name, email, and own tree person ID (also confirms the session is valid) |
 | `search-persons` | Search individuals in the Family Tree |
-| `get-person` | Get details for a person by ID |
-| `get-ancestors` | View ancestors (default 4 generations, max 8) |
-| `get-descendants` | View descendants (default 2 generations, max 3) |
-| `search-records` | Search historical record collections |
+| `get-person` | Names, all facts, parents, siblings, spouses (with marriage), and children |
+| `get-ancestors` | Pedigree, Ahnentafel-numbered (default 4 generations, max 8) |
+| `get-descendants` | Descendants with spouses (default 2 generations, max 4) |
+| `relationship-to-me` | How you're related to a person, with the full path |
+| `get-sources` | Sources attached to a person, with record IDs |
+| `get-record` | A full historical record: every person on it, ages, relationships, events |
+| `get-memories` | Photos, stories, and documents attached to a person |
+| `get-notes` | Research notes on a person |
+| `get-change-history` | Who changed a person, when, and why |
+| `get-record-hints` | FamilySearch's suggested matching records |
+| `get-data-quality` | Quality scores and specific issues (conflicts, missing sources) |
+| `search-records` | Search indexed historical records (names, dates, places, spouse, parents, collection; paged) |
+| `search-fulltext` | Search the text of handwritten documents (wills, deeds); quote phrases for exact match |
+| `search-collections` | Find record collections by keyword and/or year covered |
+| `search-catalog` | Search the FamilySearch Library catalog |
+| `standardize-place` | Match a place name to FamilySearch's standard places |
+| `standardize-date` | Interpret a genealogical date into standard form |
+
+Tools that take a `personId` marked optional default to your own tree person.
 
 ### Example prompts
 
@@ -228,6 +245,18 @@ Get 4 generations of ancestors for personId G2KQ-JTH
 Search historical records for surname "Reiss" in "Pennsylvania"
 ```
 
+```
+How am I related to person G2KQ-JTH?
+```
+
+```
+Show the sources attached to G2KQ-JTH, then open the 1870 census record
+```
+
+```
+Find full-text documents mentioning "John Smith"
+```
+
 ---
 
 ## Troubleshooting
@@ -235,7 +264,7 @@ Search historical records for surname "Reiss" in "Pennsylvania"
 | Problem | Fix |
 |---|---|
 | "Not authenticated" errors | Run `npm run login` or use `set-session-cookie` |
-| Session expired / 401 errors | Re-run `npm run login` |
+| "Session is not signed in or has expired" | Re-run `npm run login`, then reconnect the MCP server |
 | "Request blocked by FamilySearch security (error 15)" | Re-run `npm run login` to refresh bot-protection cookies |
 | Brave not found | Install [Brave](https://brave.com/download/) or set `BRAVE_PATH` to your Brave executable |
 | MCP tools not appearing | Confirm `npm run build` succeeded and restart your MCP client |
