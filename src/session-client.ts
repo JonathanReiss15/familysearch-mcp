@@ -83,10 +83,23 @@ export class FamilySearchSessionClient {
     return this.cookies;
   }
 
-  private async request<T>(path: string, params?: Record<string, string | number | boolean | undefined>): Promise<T> {
+  private ensureAuthenticated(): void {
     if (!this.cookies) {
       throw new FamilySearchSessionError('Not authenticated. Set a browser session cookie first.');
     }
+  }
+
+  private headers(accept: string): Record<string, string> {
+    return {
+      Accept: accept,
+      Cookie: this.cookieHeader(),
+      Referer: 'https://www.familysearch.org/en/',
+      'User-Agent': BROWSER_USER_AGENT,
+    };
+  }
+
+  private async request<T>(path: string, params?: Record<string, string | number | boolean | undefined>): Promise<T> {
+    this.ensureAuthenticated();
 
     const url = new URL(path.startsWith('http') ? path : `${BASE_URL}${path}`);
     if (params) {
@@ -97,15 +110,26 @@ export class FamilySearchSessionClient {
       }
     }
 
-    const response = await fetch(url, {
-      headers: {
-        Accept: 'application/json',
-        Cookie: this.cookieHeader(),
-        Referer: 'https://www.familysearch.org/en/',
-        'User-Agent': BROWSER_USER_AGENT,
-      },
-    });
+    const response = await fetch(url, { headers: this.headers('application/json') });
+    return this.parseJson<T>(response, path);
+  }
 
+  private async postJson<T>(path: string, body: unknown): Promise<T> {
+    this.ensureAuthenticated();
+
+    const response = await fetch(`${BASE_URL}${path}`, {
+      method: 'POST',
+      headers: {
+        ...this.headers('application/json'),
+        'Content-Type': 'application/json',
+        Origin: BASE_URL,
+      },
+      body: JSON.stringify(body),
+    });
+    return this.parseJson<T>(response, path);
+  }
+
+  private async parseJson<T>(response: Response, path: string): Promise<T> {
     const text = await response.text();
     let data: unknown;
     try {
@@ -460,6 +484,206 @@ export class FamilySearchSessionClient {
       };
     });
   }
+
+  /** Image ARKs of a digital film (DGS / image group number), in viewer order. */
+  async getFilmImages(film: string): Promise<FilmImages> {
+    const { dgsNum } = parseFilmRef(film);
+    const cached = this.filmCache.get(dgsNum);
+    if (cached) return cached;
+
+    const data = await this.postJson<{
+      dgsNum?: string;
+      images?: string[];
+      catalogs?: Array<{ data?: { display_title?: string; titleno?: string } }>;
+    }>('/search/filmdatainfo/film-data', {
+      type: 'film-data',
+      loggedIn: true,
+      sessionId: extractCookie(this.cookies, 'fssessionid'),
+      args: {
+        dgsNum,
+        locale: 'en',
+        state: { imageOrFilmUrl: `/search/film/${dgsNum}`, viewMode: 'i', selectedImageIndex: -1 },
+      },
+    });
+
+    const arkIds = (data.images || []).map((url) => normalizeImageArk(url));
+    if (!arkIds.length) {
+      throw new FamilySearchSessionError(
+        `Film ${dgsNum} has no images available to this account (not digitized, or restricted).`,
+        404,
+      );
+    }
+
+    const result: FilmImages = {
+      dgsNum,
+      arkIds,
+      catalogs: (data.catalogs || []).map((catalog) => ({
+        id: catalog.data?.titleno,
+        title: catalog.data?.display_title || 'Untitled catalog entry',
+      })),
+    };
+    this.filmCache.set(dgsNum, result);
+    return result;
+  }
+
+  /** Film number and access rights of one image. */
+  async getImageInfo(image: string): Promise<{ arkId: string; dgsNum?: string; rights?: ImageRights }> {
+    const arkId = normalizeImageArk(image);
+    const data = await this.postJson<{
+      dgsNum?: string;
+      meta?: { sourceDescriptions?: Array<{ rights?: string[] }> };
+    }>('/search/filmdatainfo/image-data', {
+      type: 'image-data',
+      args: {
+        imageURL: `${BASE_URL}/ark:/61903/${arkId}`,
+        locale: 'en',
+        state: { imageOrFilmUrl: '', selectedImageIndex: -1, viewMode: 'i' },
+      },
+    });
+
+    return {
+      arkId,
+      dgsNum: data.dgsNum,
+      rights: parseImageRights(data.meta?.sourceDescriptions?.[0]?.rights),
+    };
+  }
+
+  /**
+   * Resolves an image given either its ARK, or a film plus a 1-based image
+   * number (the "Image N of M" the viewer shows).
+   */
+  async resolveImage(ref: { image?: string; film?: string; index?: number }): Promise<ResolvedImage> {
+    if (ref.image) {
+      const info = await this.getImageInfo(ref.image);
+      const film = info.dgsNum ? await this.getFilmImages(info.dgsNum).catch(() => undefined) : undefined;
+      const position = film ? film.arkIds.indexOf(info.arkId) : -1;
+      return {
+        ...info,
+        index: position >= 0 ? position + 1 : undefined,
+        total: film?.arkIds.length,
+      };
+    }
+
+    if (ref.film) {
+      const filmRef = parseFilmRef(ref.film);
+      const index = ref.index ?? filmRef.index;
+      if (!index) {
+        throw new FamilySearchSessionError('Give index (the 1-based image number the viewer shows) together with film.');
+      }
+      const film = await this.getFilmImages(filmRef.dgsNum);
+      if (index < 1 || index > film.arkIds.length) {
+        throw new FamilySearchSessionError(
+          `Film ${film.dgsNum} has ${film.arkIds.length} images; image ${index} is out of range.`,
+        );
+      }
+      const arkId = film.arkIds[index - 1];
+      const info = await this.getImageInfo(arkId);
+      return { arkId, dgsNum: film.dgsNum, index, total: film.arkIds.length, rights: info.rights };
+    }
+
+    throw new FamilySearchSessionError('Provide image (an image ARK or viewer URL), or film plus index.');
+  }
+
+  /** Full-resolution JPEG, or a scaled one when width is given. */
+  async fetchImage(arkId: string, width?: number): Promise<Buffer> {
+    this.ensureAuthenticated();
+
+    const variant = width ? `scale?width=${width}` : '$dist';
+    const response = await fetch(`${BASE_URL}/service/records/storage/deepzoomcloud/dz/v1/${arkId}/${variant}`, {
+      headers: this.headers('image/jpeg,image/*;q=0.9,*/*;q=0.5'),
+    });
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const contentType = response.headers.get('content-type') || '';
+
+    if (response.ok && contentType.startsWith('image/') && buffer[0] === 0xff && buffer[1] === 0xd8) {
+      return buffer;
+    }
+
+    const textual = contentType.includes('json') || contentType.startsWith('text');
+    const detail = textual
+      ? buffer.toString('utf8', 0, 200).replace(/\s+/g, ' ')
+      : `${buffer.length} bytes of ${contentType || 'unknown type'}`;
+    if (response.status === 401) {
+      throw new FamilySearchSessionError('Session expired. Run login-with-browser again.', 401);
+    }
+    if (/error\s*15|incapsula|blocked by our security/i.test(detail)) {
+      throw new FamilySearchSessionError(
+        'Image request blocked by FamilySearch security (error 15). Re-run login-with-browser to refresh cookies.',
+        403,
+      );
+    }
+    throw new FamilySearchSessionError(`Image ${arkId} could not be fetched (${response.status}): ${detail}`, response.status);
+  }
+
+  private filmCache = new Map<string, FilmImages>();
+}
+
+export interface ImageRights {
+  restricted: boolean;
+  allowDownload: boolean;
+  authorized: boolean;
+}
+
+export interface FilmImages {
+  dgsNum: string;
+  arkIds: string[];
+  catalogs: Array<{ id?: string; title: string }>;
+}
+
+export interface ResolvedImage {
+  arkId: string;
+  dgsNum?: string;
+  /** 1-based position in the film, as the viewer numbers images. */
+  index?: number;
+  total?: number;
+  rights?: ImageRights;
+}
+
+/** Accepts an image ARK (3:1:…), an ark:/61903/3:1:… path, or a viewer / image.xml URL. */
+export function normalizeImageArk(input: string): string {
+  const value = input.trim();
+  const match = value.match(/3:1:([A-Z0-9]+(?:-[A-Z0-9]+)+)/i);
+  if (match) return `3:1:${match[1].toUpperCase()}`;
+  if (/^[A-Z0-9]+(?:-[A-Z0-9]+)+$/i.test(value)) return `3:1:${value.toUpperCase()}`;
+  if (/[0-9]:[0-9]:[A-Z0-9]/i.test(value)) {
+    throw new FamilySearchSessionError(
+      `${value} is not an image ARK (images start with 3:1:; 1:1: is an indexed record).`,
+    );
+  }
+  throw new FamilySearchSessionError(`Could not read an image ARK from "${value}".`);
+}
+
+/**
+ * Accepts a DGS / image group number, or a /search/film/… or
+ * records/images…imageGroupNumbers=… URL. An i= query value (0-based in the
+ * viewer URL) becomes the 1-based index.
+ */
+export function parseFilmRef(input: string): { dgsNum: string; index?: number } {
+  const value = input.trim();
+  const number =
+    value.match(/\/search\/film\/(\d+)/)?.[1] ||
+    value.match(/(?:imageGroupNumbers|dgsNum)=(\d+)/)?.[1] ||
+    value.match(/^(?:dgs\s*)?(\d{6,9})$/i)?.[1];
+  if (!number) {
+    throw new FamilySearchSessionError(`Could not read a film (DGS) number from "${value}".`);
+  }
+  const i = value.match(/[?&]i=(\d+)/)?.[1];
+  return { dgsNum: number.padStart(9, '0'), index: i !== undefined ? Number(i) + 1 : undefined };
+}
+
+export function parseImageRights(rights?: string[]): ImageRights | undefined {
+  const accessControl = rights?.find((right) => right.includes('accessControl?'));
+  if (!accessControl) return undefined;
+  const params = new URL(accessControl).searchParams;
+  return {
+    restricted: params.get('restricted') === 'true',
+    allowDownload: params.get('allowDownload') === 'true',
+    authorized: params.get('authorized') === 'true',
+  };
+}
+
+function extractCookie(cookieHeader: string, name: string): string {
+  return cookieHeader.match(new RegExp(`(?:^|;\\s*)${name}=([^;]+)`))?.[1] || '';
 }
 
 interface PersonSummary {
