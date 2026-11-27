@@ -13,6 +13,15 @@ import { join } from 'path';
 const configDir = join(homedir(), '.familysearch-mcp');
 const configPath = join(configDir, 'config.json');
 const braveProfileDir = join(configDir, 'brave-profile');
+const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
+
+function hostnameOf(url) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return '';
+  }
+}
 
 const BRAVE_PATHS = {
   darwin: ['/Applications/Brave Browser.app/Contents/MacOS/Brave Browser'],
@@ -51,8 +60,9 @@ function saveConfig(config) {
 }
 
 function readLoggedInUser(page) {
+  // FamilySearch versions the key (…-v3-user, …-v4-user), so match any version.
   return page.evaluate(() => {
-    const userKey = Object.keys(localStorage).find((key) => key.endsWith('-v3-user'));
+    const userKey = Object.keys(localStorage).find((key) => /-v\d+-user$/.test(key));
     if (!userKey) {
       return null;
     }
@@ -100,36 +110,35 @@ async function main() {
   const page = context.pages()[0] || (await context.newPage());
   await page.goto('https://www.familysearch.org/en/');
 
-  try {
-    await page.waitForFunction(
-      () => {
-        const userKey = Object.keys(localStorage).find((key) => key.endsWith('-v3-user'));
-        if (!userKey) {
-          return false;
-        }
+  // The sign-in page (ident.familysearch.org) can store the user before the
+  // redirect back to www sets fssessionid, so wait for both the cookie and a
+  // www page that knows the user.
+  const deadline = Date.now() + LOGIN_TIMEOUT_MS;
+  let user = null;
+  while (!user && Date.now() < deadline) {
+    const sessionCookies = await context.cookies(['https://www.familysearch.org']);
+    if (sessionCookies.some((cookie) => cookie.name === 'fssessionid')) {
+      for (const candidate of context.pages()) {
+        if (hostnameOf(candidate.url()) !== 'www.familysearch.org') continue;
+        user = await readLoggedInUser(candidate).catch(() => null);
+        if (user) break;
+      }
+    }
+    if (!user) await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
 
-        try {
-          const data = JSON.parse(localStorage.getItem(userKey) || '{}');
-          return Boolean(data.user?.cisId);
-        } catch {
-          return false;
-        }
-      },
-      { timeout: 5 * 60 * 1000 },
-    );
-  } catch {
+  if (!user) {
     console.error('Timed out waiting for login.');
     await context.close();
     process.exit(1);
   }
 
-  const user = await readLoggedInUser(page);
   const cookies = await context.cookies(['https://www.familysearch.org']);
   const cookieHeader = cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join('; ');
   const sessionCookie = cookies.find((cookie) => cookie.name === 'fssessionid');
   const anidCookie = cookies.find((cookie) => cookie.name === 'fs_anid');
 
-  if (!sessionCookie?.value || !user) {
+  if (!sessionCookie?.value) {
     console.error('Login was not detected. Make sure you signed in with your FamilySearch account.');
     await context.close();
     process.exit(1);
