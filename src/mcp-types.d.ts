@@ -6,7 +6,9 @@ declare module '@modelcontextprotocol/sdk/server/mcp.js' {
       name: string,
       description: string,
       parameters: Record<string, unknown>,
-      handler: (params: T) => Promise<{ content: Array<{ type: string; text: string }> }>,
+      handler: (params: T) => Promise<{
+        content: Array<{ type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }>;
+      }>,
     ): void;
 
     connect(transport: unknown): Promise<void>;

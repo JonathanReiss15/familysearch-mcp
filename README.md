@@ -8,6 +8,7 @@ A local [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server 
 - **Person details** — view a person card by ID
 - **Pedigree exploration** — ancestors (up to 8 generations) and descendants (up to 3)
 - **Historical records** — search record collections
+- **Record images** — list a digitized film's images, view them, and save them as full-resolution JPGs
 - **Browser session auth** — log in once with Brave; no FamilySearch API key required
 
 ## How it works
@@ -209,6 +210,18 @@ The full cookie string is required — bot protection cookies like `reese84` and
 | `get-ancestors` | View ancestors (default 4 generations, max 8) |
 | `get-descendants` | View descendants (default 2 generations, max 3) |
 | `search-records` | Search historical record collections |
+| `get-film-images` | List a digitized film's images (DGS / image group number): catalog titles and image ARKs in viewer order |
+| `view-image` | Return one image inline (scaled, default 1600 px wide) for reading or transcription; no file is saved |
+| `download-image` | Save one image as a full-resolution JPG |
+| `download-film-images` | Save a range of a film's images (up to 200 per call, with a pause between requests; files already saved are skipped) |
+
+### Record images
+
+Images are addressed by their ARK (`3:1:XXXX-XXXX-XXXX-X`, or the viewer URL `https://www.familysearch.org/ark:/61903/3:1:…`) or by film plus image number. The image number is the 1-based "Image N of M" the viewer shows; a `/search/film/…?i=11` URL is image 12.
+
+Files are named `<DGS>_<image number>.jpg` and saved to `outputDir`, or by default to `$FAMILYSEARCH_DOWNLOAD_DIR/<DGS>/` (falling back to `~/Downloads/familysearch/<DGS>/`).
+
+FamilySearch marks many images view-only (`allowDownload=false`): the site shows them but disables Download. The download tools refuse such images and point to `view-image`. Passing `ignoreDownloadRestriction: true` saves them anyway; that goes against FamilySearch's download setting and is at your own risk. Images your account may not view are never fetched.
 
 ### Example prompts
 
@@ -226,6 +239,14 @@ Get 4 generations of ancestors for personId G2KQ-JTH
 
 ```
 Search historical records for surname "Reiss" in "Pennsylvania"
+```
+
+```
+Show image 12 of film 007819272 and transcribe the births on it
+```
+
+```
+Download images 10-40 of film 007819272 to ~/research/scans
 ```
 
 ---
